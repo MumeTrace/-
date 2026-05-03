@@ -328,16 +328,44 @@
     }
 
     // ==================== MVU 跨设备同步 ====================
+
+    /**
+     * 查找任意可用消息 ID（不要求含 stat_data），用于存储农场数据
+     * 优先使用含 stat_data 的消息（与庇护所数据同源），找不到则用最新的助手消息
+     */
+    function findAnyMessageId() {
+        if (!mvuReady) return null;
+        try {
+            const lastMsgId = typeof getLastMessageId === 'function' ? getLastMessageId() : null;
+            if (lastMsgId === null || lastMsgId < 1) return null;
+            const messages = typeof getChatMessages === 'function'
+                ? getChatMessages('1-' + lastMsgId, { role: 'assistant' })
+                : null;
+            if (!messages || messages.length === 0) return null;
+            // 优先找含 stat_data 的消息
+            for (let i = messages.length - 1; i >= Math.max(0, messages.length - 15); i--) {
+                const mid = messages[i].message_id;
+                if (mid <= 0) continue;
+                const d = Mvu.getMvuData({ type: 'message', message_id: mid });
+                if (d?.stat_data && Object.keys(d.stat_data).length > 0) return mid;
+            }
+            // 没有 stat_data 的消息，退而用最新的助手消息
+            for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i].message_id > 0) return messages[i].message_id;
+            }
+            return null;
+        } catch (e) { return null; }
+    }
+
     /**
      * 将当前农场状态同步写入 MVU（服务端存储），实现手机/电脑数据统一
-     * @param {string} [shelterName] - 要保存的庇护所名称
      */
     async function saveFarmToMvu(shelterName) {
         if (!mvuReady) return;
         try {
-            const result = getLatestFullData();
-            if (!result) return;
-            const { data, targetMsgId } = result;
+            const targetMsgId = findAnyMessageId();
+            if (!targetMsgId) return;
+            const data = Mvu.getMvuData({ type: 'message', message_id: targetMsgId }) || {};
             if (!data.farm) data.farm = { shelters: {} };
             const name = shelterName || selectedShelter || farmConfig.selectedShelter;
             if (name) {
@@ -360,22 +388,33 @@
 
     /**
      * 从 MVU 拉取所有庇护所的农场数据，写入本地 IndexedDB
-     * @returns {Promise<boolean>} 是否成功同步
      */
     async function syncFromMvu() {
         if (!mvuReady) return false;
         try {
-            const result = getLatestFullData();
-            if (!result) return false;
-            const { data } = result;
-            if (!data.farm || !data.farm.shelters) return false;
-            for (const [name, state] of Object.entries(data.farm.shelters)) {
-                await dbPut(stateKey(name), state);
+            const lastMsgId = typeof getLastMessageId === 'function' ? getLastMessageId() : null;
+            if (lastMsgId === null || lastMsgId < 1) return false;
+            const messages = typeof getChatMessages === 'function'
+                ? getChatMessages('1-' + lastMsgId, { role: 'assistant' })
+                : null;
+            if (!messages || messages.length === 0) return false;
+            // 扫描所有近期消息，找到含 farm 数据的那条
+            for (let i = messages.length - 1; i >= Math.max(0, messages.length - 30); i--) {
+                const mid = messages[i].message_id;
+                if (mid <= 0) continue;
+                const data = Mvu.getMvuData({ type: 'message', message_id: mid });
+                if (data?.farm?.shelters && Object.keys(data.farm.shelters).length > 0) {
+                    for (const [name, state] of Object.entries(data.farm.shelters)) {
+                        await dbPut(stateKey(name), state);
+                    }
+                    if (data.farm.selectedShelter) {
+                        farmConfig.selectedShelter = data.farm.selectedShelter;
+                    }
+                    console.log('[小农场] 从 MVU 同步成功，消息ID:', mid);
+                    return true;
+                }
             }
-            if (data.farm.selectedShelter) {
-                farmConfig.selectedShelter = data.farm.selectedShelter;
-            }
-            return true;
+            return false;
         } catch (e) {
             console.warn('[小农场] MVU 同步拉取失败:', e);
             return false;
